@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/zip"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,19 +66,12 @@ func main() {
 
 func cmdUpload(args []string, anon bool) {
 	if len(args) == 0 {
-		ui.Fatalf("no files specified\nUsage: meow <file> [file...]")
+		ui.Fatalf("no files specified\nUsage: meow <file|folder> [file|folder...]")
 	}
 
-	// Validate all files exist first.
-	for _, path := range args {
-		info, err := os.Stat(path)
-		if err != nil {
-			ui.Fatalf("file not found: %s", path)
-		}
-		if info.Size() > config.MaxFileSize {
-			ui.Fatalf("%s is too large (%s, max 200 MB)", path, ui.HumanSize(info.Size()))
-		}
-	}
+	// Validate all paths exist, zip directories.
+	paths, cleanup := preparePaths(args, config.MaxFileSize, "200 MB")
+	defer cleanup()
 
 	cfg := config.Load()
 	client := api.NewClient()
@@ -91,10 +86,10 @@ func cmdUpload(args []string, anon bool) {
 		ui.Dimf("  v%s · catbox.moe", config.Version)
 		fmt.Fprintln(os.Stderr)
 
-		uploadWithProgress(client, args, fields, config.CatboxAPI)
+		uploadWithProgress(client, paths, fields, config.CatboxAPI)
 	} else {
 		// Piped mode: no decoration, just URLs.
-		for _, path := range args {
+		for _, path := range paths {
 			url, err := client.PostMultipart(config.CatboxAPI, copyFields(fields), "fileToUpload", path, nil)
 			if err != nil {
 				ui.Fatalf("upload failed: %v", err)
@@ -242,18 +237,11 @@ func cmdTemp(args []string) {
 	}
 
 	if len(files) == 0 {
-		ui.Fatalf("no files specified\nUsage: meow temp [-t time] <file> [file...]")
+		ui.Fatalf("no files specified\nUsage: meow temp [-t time] <file|folder> [file|folder...]")
 	}
 
-	for _, path := range files {
-		info, err := os.Stat(path)
-		if err != nil {
-			ui.Fatalf("file not found: %s", path)
-		}
-		if info.Size() > config.MaxLBSize {
-			ui.Fatalf("%s is too large (%s, max 1 GB)", path, ui.HumanSize(info.Size()))
-		}
-	}
+	paths, cleanup := preparePaths(files, config.MaxLBSize, "1 GB")
+	defer cleanup()
 
 	client := api.NewClient()
 	fields := map[string]string{
@@ -266,9 +254,9 @@ func cmdTemp(args []string) {
 		ui.Dimf("  v%s · litterbox (expires in %s)", config.Version, duration)
 		fmt.Fprintln(os.Stderr)
 
-		uploadWithProgress(client, files, fields, config.LitterboxAPI)
+		uploadWithProgress(client, paths, fields, config.LitterboxAPI)
 	} else {
-		for _, path := range files {
+		for _, path := range paths {
 			url, err := client.PostMultipart(config.LitterboxAPI, copyFields(fields), "fileToUpload", path, nil)
 			if err != nil {
 				ui.Fatalf("upload failed: %v", err)
@@ -539,6 +527,107 @@ func uploadWithProgress(client *api.Client, files []string, baseFields map[strin
 	}
 }
 
+// ─── Directory → Zip ────────────────────────────────────────────────────────
+
+// preparePaths validates paths and zips any directories. Returns the resolved
+// file paths and a cleanup function that removes temp zips.
+func preparePaths(args []string, maxSize int64, maxLabel string) ([]string, func()) {
+	var paths []string
+	var tmpFiles []string
+
+	for _, p := range args {
+		info, err := os.Stat(p)
+		if err != nil {
+			ui.Fatalf("not found: %s", p)
+		}
+
+		if info.IsDir() {
+			if ui.IsTTY() {
+				ui.Status(fmt.Sprintf("zipping %s/", filepath.Base(p)))
+			}
+			zipPath, err := zipDirectory(p)
+			if err != nil {
+				ui.Fatalf("failed to zip %s: %v", p, err)
+			}
+			tmpFiles = append(tmpFiles, zipPath)
+			info, _ = os.Stat(zipPath)
+			if info.Size() > maxSize {
+				os.Remove(zipPath)
+				ui.Fatalf("%s zipped is too large (%s, max %s)", p, ui.HumanSize(info.Size()), maxLabel)
+			}
+			paths = append(paths, zipPath)
+		} else {
+			if info.Size() > maxSize {
+				ui.Fatalf("%s is too large (%s, max %s)", p, ui.HumanSize(info.Size()), maxLabel)
+			}
+			paths = append(paths, p)
+		}
+	}
+
+	cleanup := func() {
+		for _, f := range tmpFiles {
+			os.Remove(f)
+		}
+	}
+	return paths, cleanup
+}
+
+// zipDirectory creates a temporary .zip of the given directory and returns
+// the path to the zip file.
+func zipDirectory(dir string) (string, error) {
+	tmpFile, err := os.CreateTemp("", filepath.Base(dir)+"-*.zip")
+	if err != nil {
+		return "", err
+	}
+	defer tmpFile.Close()
+
+	w := zip.NewWriter(tmpFile)
+	defer w.Close()
+
+	base := filepath.Dir(dir)
+	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		rel, err := filepath.Rel(base, path)
+		if err != nil {
+			return err
+		}
+
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = rel
+		header.Method = zip.Deflate
+
+		writer, err := w.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		_, err = io.Copy(writer, file)
+		return err
+	})
+
+	if err != nil {
+		os.Remove(tmpFile.Name())
+		return "", err
+	}
+
+	return tmpFile.Name(), nil
+}
+
 // ─── Help ────────────────────────────────────────────────────────────────────
 
 func printUsage() {
@@ -549,9 +638,9 @@ func printUsage() {
 
 	fmt.Fprintf(os.Stderr, `
 %sUsage:%s
-  meow <file> [file...]                   Upload files (permanent)
+  meow <file|folder> [file|folder...]     Upload files or folders (permanent)
   meow url <url>                          Upload from URL
-  meow temp [-t 1h|12h|24h|72h] <file>   Temporary upload (default: 24h)
+  meow temp [-t 1h|12h|24h|72h] <path>   Temporary upload (default: 24h)
   meow delete <filename> [filename...]    Delete uploaded files
   meow album <command>                    Album management
   meow auth [userhash]                    Set or view auth
@@ -564,6 +653,7 @@ func printUsage() {
 %sExamples:%s
   %smeow screenshot.png                     # Upload and copy URL%s
   %smeow *.jpg                              # Upload multiple files%s
+  %smeow ./my-project                       # Zip folder and upload%s
   %smeow url https://i.imgur.com/x.png      # Re-host from URL%s
   %smeow temp -t 1h debug.log               # Temp upload, expires in 1 hour%s
   %smeow delete abc123.png                  # Delete a file%s
@@ -572,6 +662,7 @@ func printUsage() {
 `, ui.Bold, ui.Reset,
 		ui.Bold, ui.Reset,
 		ui.Bold, ui.Reset,
+		ui.Dim, ui.Reset,
 		ui.Dim, ui.Reset,
 		ui.Dim, ui.Reset,
 		ui.Dim, ui.Reset,
