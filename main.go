@@ -71,7 +71,6 @@ func cmdUpload(args []string, anon bool) {
 
 	// Validate all paths exist, zip directories.
 	paths, cleanup := preparePaths(args, config.MaxFileSize, "200 MB")
-	defer cleanup()
 
 	cfg := config.Load()
 	client := api.NewClient()
@@ -85,17 +84,12 @@ func cmdUpload(args []string, anon bool) {
 		ui.Header("meow")
 		ui.Dimf("  v%s · catbox.moe", config.Version)
 		fmt.Fprintln(os.Stderr)
+	}
 
-		uploadWithProgress(client, paths, fields, config.CatboxAPI)
-	} else {
-		// Piped mode: no decoration, just URLs.
-		for _, path := range paths {
-			url, err := client.PostMultipart(config.CatboxAPI, copyFields(fields), "fileToUpload", path, nil)
-			if err != nil {
-				ui.Fatalf("upload failed: %v", err)
-			}
-			fmt.Println(url)
-		}
+	ok := uploadFiles(client, paths, fields, config.CatboxAPI)
+	cleanup()
+	if !ok {
+		os.Exit(1)
 	}
 }
 
@@ -123,7 +117,7 @@ func cmdURLUpload(args []string, anon bool) {
 		fmt.Fprintln(os.Stderr)
 
 		model := tui.NewSpinnerModel("uploading from URL...", func() tea.Msg {
-			url, err := client.PostMultipart(config.CatboxAPI, fields, "", "", nil)
+			url, err := client.PostUpload(config.CatboxAPI, fields, "", "", nil)
 			if err != nil {
 				return tui.ActionErrMsg{Err: err}
 			}
@@ -145,7 +139,7 @@ func cmdURLUpload(args []string, anon bool) {
 		fmt.Println(m.Result)
 		ui.Clipboard(m.Result)
 	} else {
-		url, err := client.PostMultipart(config.CatboxAPI, fields, "", "", nil)
+		url, err := client.PostUpload(config.CatboxAPI, fields, "", "", nil)
 		if err != nil {
 			ui.Fatalf("upload failed: %v", err)
 		}
@@ -241,7 +235,6 @@ func cmdTemp(args []string) {
 	}
 
 	paths, cleanup := preparePaths(files, config.MaxLBSize, "1 GB")
-	defer cleanup()
 
 	client := api.NewClient()
 	fields := map[string]string{
@@ -253,16 +246,12 @@ func cmdTemp(args []string) {
 		ui.Header("meow")
 		ui.Dimf("  v%s · litterbox (expires in %s)", config.Version, duration)
 		fmt.Fprintln(os.Stderr)
+	}
 
-		uploadWithProgress(client, paths, fields, config.LitterboxAPI)
-	} else {
-		for _, path := range paths {
-			url, err := client.PostMultipart(config.LitterboxAPI, copyFields(fields), "fileToUpload", path, nil)
-			if err != nil {
-				ui.Fatalf("upload failed: %v", err)
-			}
-			fmt.Println(url)
-		}
+	ok := uploadFiles(client, paths, fields, config.LitterboxAPI)
+	cleanup()
+	if !ok {
+		os.Exit(1)
 	}
 }
 
@@ -333,7 +322,7 @@ func albumCreate(cfg config.Config, client *api.Client, args []string) {
 		fields["userhash"] = cfg.Userhash
 	}
 
-	url, err := client.PostMultipart(config.CatboxAPI, fields, "", "", nil)
+	url, err := client.PostUpload(config.CatboxAPI, fields, "", "", nil)
 	if err != nil {
 		ui.Fatalf("album creation failed: %v", err)
 	}
@@ -482,14 +471,33 @@ func copyFields(fields map[string]string) map[string]string {
 	return cp
 }
 
+// uploadFiles uploads each path and reports whether every upload succeeded.
+// It does not exit, so the caller can remove temp zips first.
+func uploadFiles(client *api.Client, paths []string, fields map[string]string, apiURL string) bool {
+	if ui.IsTTY() {
+		return uploadWithProgress(client, paths, fields, apiURL)
+	}
+
+	// Piped mode: no decoration, just URLs.
+	for _, path := range paths {
+		url, err := client.PostUpload(apiURL, copyFields(fields), "fileToUpload", path, nil)
+		if err != nil {
+			ui.Error(fmt.Sprintf("upload failed: %v", err))
+			return false
+		}
+		fmt.Println(url)
+	}
+	return true
+}
+
 // uploadWithProgress runs a bubbletea program with a progress bar for file uploads (TTY mode).
-func uploadWithProgress(client *api.Client, files []string, baseFields map[string]string, apiURL string) {
+func uploadWithProgress(client *api.Client, files []string, baseFields map[string]string, apiURL string) bool {
 	var p *tea.Program
 
 	uploadFn := func(path string) tea.Cmd {
 		return func() tea.Msg {
 			fields := copyFields(baseFields)
-			url, err := client.PostMultipart(apiURL, fields, "fileToUpload", path,
+			url, err := client.PostUpload(apiURL, fields, "fileToUpload", path,
 				func(bytesRead, total int64) {
 					p.Send(tui.ProgressMsg{BytesRead: bytesRead, Total: total})
 				},
@@ -506,7 +514,8 @@ func uploadWithProgress(client *api.Client, files []string, baseFields map[strin
 
 	final, err := p.Run()
 	if err != nil {
-		ui.Fatalf("TUI error: %v", err)
+		ui.Error(fmt.Sprintf("TUI error: %v", err))
+		return false
 	}
 
 	m := final.(*tui.UploadModel)
@@ -522,9 +531,7 @@ func uploadWithProgress(client *api.Client, files []string, baseFields map[strin
 		ui.Clipboard(urls[0])
 	}
 
-	if m.HasErrors() {
-		os.Exit(1)
-	}
+	return !m.HasErrors()
 }
 
 // ─── Directory → Zip ────────────────────────────────────────────────────────
@@ -533,12 +540,22 @@ func uploadWithProgress(client *api.Client, files []string, baseFields map[strin
 // file paths and a cleanup function that removes temp zips.
 func preparePaths(args []string, maxSize int64, maxLabel string) ([]string, func()) {
 	var paths []string
-	var tmpFiles []string
+	var tmpDirs []string
+
+	cleanup := func() {
+		for _, d := range tmpDirs {
+			os.RemoveAll(d)
+		}
+	}
+	fail := func(format string, a ...any) {
+		cleanup()
+		ui.Fatalf(format, a...)
+	}
 
 	for _, p := range args {
 		info, err := os.Stat(p)
 		if err != nil {
-			ui.Fatalf("not found: %s", p)
+			fail("not found: %s", p)
 		}
 
 		if info.IsDir() {
@@ -547,42 +564,55 @@ func preparePaths(args []string, maxSize int64, maxLabel string) ([]string, func
 			}
 			zipPath, err := zipDirectory(p)
 			if err != nil {
-				ui.Fatalf("failed to zip %s: %v", p, err)
+				fail("failed to zip %s: %v", p, err)
 			}
-			tmpFiles = append(tmpFiles, zipPath)
+			tmpDirs = append(tmpDirs, filepath.Dir(zipPath))
 			info, _ = os.Stat(zipPath)
 			if info.Size() > maxSize {
-				os.Remove(zipPath)
-				ui.Fatalf("%s zipped is too large (%s, max %s)", p, ui.HumanSize(info.Size()), maxLabel)
+				fail("%s zipped is too large (%s, max %s)", p, ui.HumanSize(info.Size()), maxLabel)
 			}
 			paths = append(paths, zipPath)
 		} else {
 			if info.Size() > maxSize {
-				ui.Fatalf("%s is too large (%s, max %s)", p, ui.HumanSize(info.Size()), maxLabel)
+				fail("%s is too large (%s, max %s)", p, ui.HumanSize(info.Size()), maxLabel)
 			}
 			paths = append(paths, p)
 		}
 	}
 
-	cleanup := func() {
-		for _, f := range tmpFiles {
-			os.Remove(f)
-		}
-	}
 	return paths, cleanup
 }
 
-// zipDirectory creates a temporary .zip of the given directory and returns
-// the path to the zip file.
+// zipDirectory writes <dir name>.zip into a new directory under the system
+// temp dir and returns the path to the zip file.
 func zipDirectory(dir string) (string, error) {
-	tmpFile, err := os.CreateTemp("", filepath.Base(dir)+"-*.zip")
+	// Resolve "." and ".." so the zip gets the real directory name.
+	dir, err := filepath.Abs(dir)
 	if err != nil {
 		return "", err
 	}
-	defer tmpFile.Close()
 
-	w := zip.NewWriter(tmpFile)
-	defer w.Close()
+	tmpDir, err := os.MkdirTemp("", "meow-*")
+	if err != nil {
+		return "", err
+	}
+
+	zipPath := filepath.Join(tmpDir, filepath.Base(dir)+".zip")
+	if err := writeZip(dir, zipPath); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", err
+	}
+	return zipPath, nil
+}
+
+func writeZip(dir, zipPath string) error {
+	zipFile, err := os.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	defer zipFile.Close()
+
+	w := zip.NewWriter(zipFile)
 
 	base := filepath.Dir(dir)
 	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
@@ -619,13 +649,12 @@ func zipDirectory(dir string) (string, error) {
 		_, err = io.Copy(writer, file)
 		return err
 	})
-
 	if err != nil {
-		os.Remove(tmpFile.Name())
-		return "", err
+		return err
 	}
 
-	return tmpFile.Name(), nil
+	// The central directory is written on Close, so its error must not be dropped.
+	return w.Close()
 }
 
 // ─── Help ────────────────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ProgressFunc is called during file upload with bytes read and total size.
@@ -36,7 +38,33 @@ type Client struct {
 }
 
 func NewClient() *Client {
-	return &Client{http: &http.Client{}}
+	// A whole-request timeout would cut off large uploads, so only the wait
+	// for the response is limited.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 2 * time.Minute
+	return &Client{http: &http.Client{Transport: transport}}
+}
+
+// PostUpload is PostMultipart for requests that must return a URL. Catbox can
+// answer 200 with an empty or plain-text body when an upload fails.
+func (c *Client) PostUpload(
+	apiURL string,
+	fields map[string]string,
+	fileField string,
+	filePath string,
+	onProgress ProgressFunc,
+) (string, error) {
+	result, err := c.PostMultipart(apiURL, fields, fileField, filePath, onProgress)
+	if err != nil {
+		return "", err
+	}
+	if result == "" {
+		return "", errors.New("server returned an empty response")
+	}
+	if !strings.HasPrefix(result, "http://") && !strings.HasPrefix(result, "https://") {
+		return "", fmt.Errorf("server did not return a URL: %s", result)
+	}
+	return result, nil
 }
 
 // PostMultipart sends a multipart POST request. If filePath is non-empty, the file
@@ -130,6 +158,9 @@ func (c *Client) doRequest(req *http.Request) (string, error) {
 
 	result := strings.TrimSpace(string(respBody))
 	if resp.StatusCode != 200 {
+		if result == "" || strings.HasPrefix(result, "<") {
+			return "", fmt.Errorf("server returned %s", resp.Status)
+		}
 		return "", fmt.Errorf("server returned %d: %s", resp.StatusCode, result)
 	}
 	return result, nil
